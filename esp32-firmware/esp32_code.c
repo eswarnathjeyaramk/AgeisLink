@@ -26,11 +26,11 @@ unsigned long lastTime = 0;
 bool alertActive = false;
 bool buttonWasPressed = false;
 unsigned long crashTime = 0;
-const unsigned long safetyWindow = 3000; // Currently set to 3s per your request
+const unsigned long safetyWindow = 15000; // Currently set to 15s per your request
 
 // Engineering Thresholds
-const float jerkThreshold = 40.0; 
-const float accelThreshold = 40.0; 
+const float jerkThreshold = 60.0; 
+const float accelThreshold = 60.0; 
 
 // --- BLE Server Callbacks ---
 class MyServerCallbacks : public BLEServerCallbacks {
