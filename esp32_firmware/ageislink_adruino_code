@@ -1,0 +1,88 @@
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Wire.h>
+
+Adafruit_MPU6050 mpu;
+
+// Hardware Lead's Pin Assignments
+const int buzzerPin = 18;      
+const int buttonPin = 13;      
+const int onboardLED = 2;      
+
+float lastAmag = 0;
+unsigned long lastTime = 0;
+
+// Variables for 20-second Safety Logic
+bool alertActive = false;
+bool buttonWasPressed = false;
+unsigned long crashTime = 0;
+const unsigned long safetyWindow = 20000; // 20 seconds 
+
+// Engineering Thresholds
+const float jerkThreshold = 120.0; 
+const float accelThreshold = 45.0; 
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(buzzerPin, OUTPUT);
+  pinMode(onboardLED, OUTPUT);
+  pinMode(buttonPin, INPUT_PULLUP); 
+  if (!mpu.begin()) {
+    while (1) yield();
+  }
+  digitalWrite(onboardLED, HIGH); 
+  lastTime = millis();
+}
+
+void loop() {
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  unsigned long currentTime = millis();
+  float dt = (currentTime - lastTime) / 1000.0;
+  if (dt <= 0) return;
+
+  // Simplified Math: Z - 9.8 [cite: 75]
+  float Amag = sqrt(pow(a.acceleration.x, 2) + 
+                    pow(a.acceleration.y, 2) + 
+                    pow(a.acceleration.z - 9.8, 2));
+
+  float jerk = abs(Amag - lastAmag) / dt; // [cite: 70, 86]
+
+  // --- STEP 1: DETECT IMPACT ---
+  if (jerk > jerkThreshold && Amag > accelThreshold && !alertActive) {
+    alertActive = true;
+    buttonWasPressed = false; // Reset button status
+    crashTime = currentTime; 
+    digitalWrite(buzzerPin, HIGH); // Start Buzzer immediately 
+    Serial.println("!!! IMPACT DETECTED !!!");
+  }
+
+  // --- STEP 2: THE 20-SECOND MONITORING WINDOW ---
+  if (alertActive) {
+    // Continuously check if the button is pressed during these 20 seconds
+    if (digitalRead(buttonPin) == LOW) {
+      buttonWasPressed = true; // Mark that user reacted
+    }
+
+    // --- STEP 3: FINAL DECISION AFTER 20 SECONDS ---
+    if (currentTime - crashTime >= safetyWindow) {
+      digitalWrite(buzzerPin, LOW); // Stop buzzer after 20s
+      alertActive = false;
+
+      if (buttonWasPressed) {
+        // User is safe/fine 
+        Serial.println("ALARM CANCELLED BY USER WITHIN 20s");
+      } else {
+        // No response - User might be incapacitated [cite: 106, 107]
+        Serial.println("CRITICAL: NO RESPONSE AFTER 20s.");
+        Serial.print("CRASH DATA (JERK): "); 
+        Serial.println(jerk); // Print jerk value only if not cancelled 
+      }
+    }
+  }
+
+  lastAmag = Amag;
+  lastTime = currentTime;
+  delay(10); 
+}
