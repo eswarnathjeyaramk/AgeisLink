@@ -1,0 +1,23 @@
+name: ble_test_app
+description: BLE Crash Alert App
+
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.2.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  flutter_blue_plus: ^1.16.0
+  geolocator: ^10.1.0
+  permission_handler: ^11.0.1
+  url_launcher: ^6.2.5
+
+
+
+flutter:
+  uses-material-design: true
