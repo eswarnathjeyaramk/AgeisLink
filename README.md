@@ -1,4 +1,4 @@
-# 🚗 BLE Crash Detection System
+#  BLE Crash Detection System
 
 A Flutter-based Crash Detection App integrated with ESP32 using Bluetooth Low Energy (BLE).
 
