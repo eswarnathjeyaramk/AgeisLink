@@ -2,11 +2,120 @@ import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:url_launcher/url_launcher.dart';
 import 'dart:async';
 import 'dart:math';
+import 'dart:convert';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
+import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:ble_test_app/config/twilio_config_local.dart';
+
+
+class EmergencyContact {
+  final String id;
+  final String name;
+  final String phone;
+  final String relationship;
+
+  EmergencyContact({
+    required this.id,
+    required this.name,
+    required this.phone,
+    this.relationship = '',
+  });
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'name': name,
+        'phone': phone,
+        'relationship': relationship,
+      };
+
+  factory EmergencyContact.fromJson(Map<String, dynamic> json) =>
+      EmergencyContact(
+        id: json['id'],
+        name: json['name'],
+        phone: json['phone'],
+        relationship: json['relationship'] ?? '',
+      );
+}
+
+// ─────────────────────────────────────────────
+//  CONTACT STORE
+// ─────────────────────────────────────────────
+class ContactStore {
+  static const _key = 'emergency_contacts';
+
+  static Future<List<EmergencyContact>> load() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getStringList(_key) ?? [];
+    return raw
+        .map((e) => EmergencyContact.fromJson(jsonDecode(e)))
+        .toList();
+  }
+
+  static Future<void> save(List<EmergencyContact> contacts) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList(
+      _key,
+      contacts.map((e) => jsonEncode(e.toJson())).toList(),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────
+//  TWILIO SERVICE
+// ─────────────────────────────────────────────
+class TwilioService {
+  /// Returns null on success, error string on failure.
+  static Future<String?> sendSms({
+    required String to,
+    required String body,
+  }) async {
+    final url = Uri.parse(
+      'https://api.twilio.com/2010-04-01/Accounts/${TwilioConfig.accountSid}/Messages.json',
+    );
+
+    final credentials = base64Encode(
+      utf8.encode('${TwilioConfig.accountSid}:${TwilioConfig.authToken}'),
+    );
+
+    try {
+      final response = await http.post(
+        url,
+        headers: {
+          'Authorization': 'Basic $credentials',
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: {
+          'MessagingServiceSid': TwilioConfig.messagingServiceSid,
+          'To': to,
+          'Body': body,
+        },
+      ).timeout(const Duration(seconds: 15));
+
+      if (response.statusCode == 201) return null; // success
+      final decoded = jsonDecode(response.body);
+      return decoded['message'] ?? 'HTTP ${response.statusCode}';
+    } catch (e) {
+      return e.toString();
+    }
+  }
+
+  /// Send to all contacts. Returns list of failures (empty = all OK).
+  static Future<List<String>> sendToAll({
+    required List<EmergencyContact> contacts,
+    required String body,
+  }) async {
+    final failures = <String>[];
+    await Future.wait(contacts.map((c) async {
+      final err = await sendSms(to: c.phone, body: body);
+      if (err != null) failures.add('${c.name}: $err');
+    }));
+    return failures;
+  }
+}
 
 // ─────────────────────────────────────────────
 //  GLOBAL FLAGS
@@ -86,6 +195,9 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
   // ── Alert log ────────────────────────────
   final List<String> alertLog = [];
 
+  // ── Contacts ─────────────────────────────
+  List<EmergencyContact> _contacts = [];
+
   // ── Tabs ─────────────────────────────────
   late TabController _tabController;
 
@@ -98,7 +210,8 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 3, vsync: this);
+    _tabController = TabController(length: 4, vsync: this);
+    _loadContacts();
     initBle();
     startLocationTracking();
   }
@@ -108,6 +221,18 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
     positionStream?.cancel();
     _tabController.dispose();
     super.dispose();
+  }
+
+  // ─────────────────────────────────────────
+  //  CONTACTS
+  // ─────────────────────────────────────────
+  Future<void> _loadContacts() async {
+    final contacts = await ContactStore.load();
+    if (mounted) setState(() => _contacts = contacts);
+  }
+
+  Future<void> _saveContacts() async {
+    await ContactStore.save(_contacts);
   }
 
   // ─────────────────────────────────────────
@@ -157,7 +282,6 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
     setState(() => status = "Connected ✅");
     isReconnecting = false;
 
-    // Auto-reconnect on drop
     espDevice!.connectionState.listen((state) {
       if (state == BluetoothConnectionState.disconnected && !isReconnecting) {
         isReconnecting = true;
@@ -166,7 +290,6 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
       }
     });
 
-    // Discover services
     List<BluetoothService> services = await espDevice!.discoverServices();
 
     for (var service in services) {
@@ -175,7 +298,6 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
           notifyChar = char;
           await notifyChar!.setNotifyValue(true);
 
-          // ── Single listener — no duplicate ──
           notifyChar!.onValueReceived.listen((value) async {
             if (!mounted) return;
             final data = String.fromCharCodes(value).trim();
@@ -194,7 +316,6 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
   // ─────────────────────────────────────────
   //  PARSE CSV FROM ESP32
   //  Format: "ax,ay,az,gx,gy,gz,temp"
-  //  e.g.  "0.12,-0.05,9.81,1.2,-0.3,0.1,28.5"
   // ─────────────────────────────────────────
   void _parseBleData(String data) {
     final parts = data.split(',');
@@ -216,7 +337,6 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
         rawBleData = data;
       });
 
-      // Crash detection: >2.5g spike
       if (mag > 25.0 && verifyCrash()) {
         _triggerSosIfNeeded();
       }
@@ -224,14 +344,13 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
   }
 
   // ─────────────────────────────────────────
-  //  CRASH VERIFY (speed + acc both required)
+  //  CRASH VERIFY
   // ─────────────────────────────────────────
   bool verifyCrash() {
     final speedKmh = currentSpeed * 3.6;
     return speedKmh > 5 && accMagnitude > 20.0;
   }
 
-  // Prevent SOS spam — 30 s cooldown
   void _triggerSosIfNeeded() {
     final now = DateTime.now();
     if (_lastSosTrigger != null &&
@@ -259,7 +378,6 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
         if (trailPoints.length > 800) trailPoints.removeAt(0);
       });
 
-      // Move map camera to follow user
       try {
         _mapController.move(LatLng(currentLat, currentLng), 16);
       } catch (_) {}
@@ -303,9 +421,15 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
   }
 
   // ─────────────────────────────────────────
-  //  SOS
+  //  SOS — Twilio
   // ─────────────────────────────────────────
   Future<void> sendCrashSOS() async {
+    if (_contacts.isEmpty) {
+      _addAlert("⚠️ No emergency contacts saved. SOS not sent.");
+      setState(() => status = "⚠️ No contacts for SOS");
+      return;
+    }
+
     setState(() => status = "🚨 SOS Triggered");
 
     Position pos = await Geolocator.getCurrentPosition(
@@ -318,13 +442,17 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
         "Acceleration: ${accMagnitude.toStringAsFixed(2)} m/s²\n"
         "Location: $url";
 
-    // ⚠️ Replace with your emergency contacts
-    final contacts = ["9514823002", "8939243866"];
+    final failures = await TwilioService.sendToAll(
+      contacts: _contacts,
+      body: message,
+    );
 
-    for (final number in contacts) {
-      final smsUri = Uri.parse(
-          "sms:$number?body=${Uri.encodeComponent(message)}");
-      if (await canLaunchUrl(smsUri)) await launchUrl(smsUri);
+    if (failures.isEmpty) {
+      _addAlert("✅ SOS sent to ${_contacts.length} contact(s)");
+      setState(() => status = "Receiving data 📡");
+    } else {
+      _addAlert("⚠️ SOS partial failure: ${failures.join(', ')}");
+      setState(() => status = "SOS partial failure");
     }
   }
 
@@ -332,7 +460,9 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
   //  ALERT LOG
   // ─────────────────────────────────────────
   void _addAlert(String msg) {
-    final time = TimeOfDay.now().format(context);
+    final now = TimeOfDay.now();
+    final time =
+        '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}';
     setState(() => alertLog.insert(0, "[$time] $msg"));
     if (alertLog.length > 50) alertLog.removeLast();
   }
@@ -355,11 +485,10 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
     return Scaffold(
       appBar: AppBar(
         title: const Text(
-          "Geo Movement Analysis",
+          "AgeisLink",
           style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16),
         ),
         actions: [
-          // BLE status dot
           Padding(
             padding: const EdgeInsets.only(right: 16),
             child: Center(
@@ -387,10 +516,12 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
           indicatorColor: Colors.cyanAccent,
           labelColor: Colors.cyanAccent,
           unselectedLabelColor: Colors.grey,
+          isScrollable: true,
           tabs: const [
             Tab(icon: Icon(Icons.dashboard, size: 18), text: "Dashboard"),
             Tab(icon: Icon(Icons.map, size: 18), text: "Map"),
             Tab(icon: Icon(Icons.warning_amber, size: 18), text: "Alerts"),
+            Tab(icon: Icon(Icons.contacts, size: 18), text: "Contacts"),
           ],
         ),
       ),
@@ -401,6 +532,13 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
           _buildDashboard(),
           _buildMap(),
           _buildAlerts(),
+          ContactsScreen(
+            contacts: _contacts,
+            onChanged: (updated) {
+              setState(() => _contacts = updated);
+              _saveContacts();
+            },
+          ),
         ],
       ),
     );
@@ -415,7 +553,6 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // ── GPS Section ──
           _sectionLabel("📍 GPS & Movement"),
           const SizedBox(height: 8),
           Row(children: [
@@ -454,7 +591,6 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
 
           const SizedBox(height: 20),
 
-          // ── MPU6050 Section ──
           _sectionLabel("🔵 ESP32 MPU6050"),
           const SizedBox(height: 8),
 
@@ -480,7 +616,34 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
 
           const SizedBox(height: 20),
 
-          // ── Manual SOS Button ──
+          // Contact count warning
+          if (_contacts.isEmpty)
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(12),
+              margin: const EdgeInsets.only(bottom: 12),
+              decoration: BoxDecoration(
+                color: Colors.orange.withOpacity(0.1),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: Colors.orange.withOpacity(0.4)),
+              ),
+              child: Row(children: [
+                const Icon(Icons.warning_amber, color: Colors.orange, size: 18),
+                const SizedBox(width: 10),
+                const Expanded(
+                  child: Text(
+                    "No emergency contacts saved. SOS won't be sent.",
+                    style: TextStyle(color: Colors.orange, fontSize: 13),
+                  ),
+                ),
+                TextButton(
+                  onPressed: () => _tabController.animateTo(3),
+                  child: const Text("Add",
+                      style: TextStyle(color: Colors.cyanAccent, fontSize: 13)),
+                ),
+              ]),
+            ),
+
           SizedBox(
             width: double.infinity,
             child: ElevatedButton.icon(
@@ -528,7 +691,6 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
               userAgentPackageName: 'com.example.blegeo',
             ),
 
-            // Movement trail
             if (trailPoints.length > 1)
               PolylineLayer(
                 polylines: [
@@ -540,7 +702,6 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
                 ],
               ),
 
-            // Current position marker
             if (currentLat != 0)
               MarkerLayer(
                 markers: [
@@ -576,7 +737,6 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
           ],
         ),
 
-        // Speed HUD bottom-left
         Positioned(
           bottom: 20,
           left: 16,
@@ -601,7 +761,6 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
           ),
         ),
 
-        // Zone status top-left
         Positioned(
           top: 12,
           left: 12,
@@ -867,7 +1026,6 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
     );
   }
 
-  // Trail distance helper
   String _totalTrailKm() {
     if (trailPoints.length < 2) return "0.00";
     double total = 0;
@@ -878,5 +1036,314 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
       );
     }
     return (total / 1000).toStringAsFixed(2);
+  }
+}
+
+// ─────────────────────────────────────────────
+//  CONTACTS SCREEN  (Tab 4)
+// ─────────────────────────────────────────────
+class ContactsScreen extends StatelessWidget {
+  final List<EmergencyContact> contacts;
+  final void Function(List<EmergencyContact>) onChanged;
+
+  const ContactsScreen({
+    super.key,
+    required this.contacts,
+    required this.onChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFF0A0E1A),
+      body: contacts.isEmpty
+          ? Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Icon(Icons.person_add_alt_1,
+                      size: 48, color: Colors.grey),
+                  const SizedBox(height: 12),
+                  const Text("No contacts saved",
+                      style: TextStyle(color: Colors.grey, fontSize: 14)),
+                  const SizedBox(height: 4),
+                  const Text("SOS needs at least one contact",
+                      style: TextStyle(color: Colors.grey, fontSize: 12)),
+                  const SizedBox(height: 20),
+                  ElevatedButton.icon(
+                    onPressed: () => _openContactForm(context, null),
+                    icon: const Icon(Icons.add),
+                    label: const Text("Add Contact"),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.cyanAccent,
+                      foregroundColor: Colors.black,
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(10)),
+                    ),
+                  ),
+                ],
+              ),
+            )
+          : ListView.builder(
+              padding: const EdgeInsets.fromLTRB(14, 14, 14, 90),
+              itemCount: contacts.length,
+              itemBuilder: (ctx, i) {
+                final c = contacts[i];
+                return Container(
+                  margin: const EdgeInsets.only(bottom: 10),
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 14, vertical: 12),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF111827),
+                    borderRadius: BorderRadius.circular(14),
+                    border:
+                        Border.all(color: const Color(0xFF1E293B)),
+                  ),
+                  child: Row(children: [
+                    CircleAvatar(
+                      backgroundColor:
+                          Colors.cyanAccent.withOpacity(0.15),
+                      child: Text(
+                        c.name.isNotEmpty
+                            ? c.name[0].toUpperCase()
+                            : '?',
+                        style: const TextStyle(
+                            color: Colors.cyanAccent,
+                            fontWeight: FontWeight.w700),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                          crossAxisAlignment:
+                              CrossAxisAlignment.start,
+                          children: [
+                            Text(c.name,
+                                style: const TextStyle(
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.w700,
+                                    color: Colors.white)),
+                            if (c.relationship.isNotEmpty)
+                              Text(c.relationship,
+                                  style: const TextStyle(
+                                      fontSize: 11,
+                                      color: Colors.grey)),
+                            Text(c.phone,
+                                style: const TextStyle(
+                                    fontSize: 13,
+                                    color: Colors.white70)),
+                          ]),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.edit,
+                          color: Colors.cyanAccent, size: 20),
+                      onPressed: () =>
+                          _openContactForm(context, c),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.delete_outline,
+                          color: Colors.red, size: 20),
+                      onPressed: () =>
+                          _confirmDelete(context, c),
+                    ),
+                  ]),
+                );
+              },
+            ),
+      floatingActionButton: contacts.isNotEmpty
+          ? FloatingActionButton(
+              onPressed: () => _openContactForm(context, null),
+              backgroundColor: Colors.cyanAccent,
+              foregroundColor: Colors.black,
+              child: const Icon(Icons.add),
+            )
+          : null,
+    );
+  }
+
+  void _openContactForm(BuildContext context, EmergencyContact? existing) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF111827),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (_) => _ContactForm(
+        existing: existing,
+        onSave: (contact) {
+          final updated = List<EmergencyContact>.from(contacts);
+          if (existing != null) {
+            final idx = updated.indexWhere((c) => c.id == existing.id);
+            if (idx != -1) updated[idx] = contact;
+          } else {
+            updated.add(contact);
+          }
+          onChanged(updated);
+        },
+      ),
+    );
+  }
+
+  void _confirmDelete(BuildContext context, EmergencyContact c) {
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: const Color(0xFF111827),
+        title: const Text("Delete Contact",
+            style: TextStyle(color: Colors.white)),
+        content: Text("Remove ${c.name} from emergency contacts?",
+            style: const TextStyle(color: Colors.white70)),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child:
+                const Text("Cancel", style: TextStyle(color: Colors.grey)),
+          ),
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              final updated =
+                  contacts.where((x) => x.id != c.id).toList();
+              onChanged(updated);
+            },
+            child: const Text("Delete",
+                style: TextStyle(color: Colors.red)),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────
+//  CONTACT FORM (bottom sheet)
+// ─────────────────────────────────────────────
+class _ContactForm extends StatefulWidget {
+  final EmergencyContact? existing;
+  final void Function(EmergencyContact) onSave;
+
+  const _ContactForm({required this.existing, required this.onSave});
+
+  @override
+  State<_ContactForm> createState() => _ContactFormState();
+}
+
+class _ContactFormState extends State<_ContactForm> {
+  late final TextEditingController _name;
+  late final TextEditingController _phone;
+  late final TextEditingController _relationship;
+
+  @override
+  void initState() {
+    super.initState();
+    _name = TextEditingController(text: widget.existing?.name ?? '');
+    _phone = TextEditingController(text: widget.existing?.phone ?? '');
+    _relationship =
+        TextEditingController(text: widget.existing?.relationship ?? '');
+  }
+
+  @override
+  void dispose() {
+    _name.dispose();
+    _phone.dispose();
+    _relationship.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    final name = _name.text.trim();
+    final phone = _phone.text.trim();
+    if (name.isEmpty || phone.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Name and phone are required")),
+      );
+      return;
+    }
+    final contact = EmergencyContact(
+      id: widget.existing?.id ??
+          DateTime.now().millisecondsSinceEpoch.toString(),
+      name: name,
+      phone: phone,
+      relationship: _relationship.text.trim(),
+    );
+    widget.onSave(contact);
+    Navigator.pop(context);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bottom = MediaQuery.of(context).viewInsets.bottom;
+    return Padding(
+      padding: EdgeInsets.fromLTRB(20, 20, 20, bottom + 20),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            widget.existing == null ? "Add Contact" : "Edit Contact",
+            style: const TextStyle(
+                fontSize: 16,
+                fontWeight: FontWeight.w700,
+                color: Colors.white),
+          ),
+          const SizedBox(height: 18),
+          _field(_name, "Name", Icons.person),
+          const SizedBox(height: 12),
+          _field(_phone, "Phone Number", Icons.phone,
+              type: TextInputType.phone),
+          const SizedBox(height: 12),
+          _field(_relationship, "Relationship (optional)", Icons.people),
+          const SizedBox(height: 20),
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton(
+              onPressed: _submit,
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.cyanAccent,
+                foregroundColor: Colors.black,
+                padding: const EdgeInsets.symmetric(vertical: 14),
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12)),
+              ),
+              child: Text(
+                widget.existing == null ? "Save Contact" : "Update Contact",
+                style: const TextStyle(fontWeight: FontWeight.w700),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _field(TextEditingController ctrl, String hint, IconData icon,
+      {TextInputType type = TextInputType.text}) {
+    return TextField(
+      controller: ctrl,
+      keyboardType: type,
+      style: const TextStyle(color: Colors.white),
+      decoration: InputDecoration(
+        hintText: hint,
+        hintStyle: const TextStyle(color: Colors.grey),
+        prefixIcon: Icon(icon, color: Colors.grey, size: 18),
+        filled: true,
+        fillColor: const Color(0xFF0A0E1A),
+        contentPadding:
+            const EdgeInsets.symmetric(vertical: 12, horizontal: 14),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(10),
+          borderSide: const BorderSide(color: Color(0xFF1E293B)),
+        ),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(10),
+          borderSide: const BorderSide(color: Color(0xFF1E293B)),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(10),
+          borderSide: const BorderSide(color: Colors.cyanAccent),
+        ),
+      ),
+    );
   }
 }
