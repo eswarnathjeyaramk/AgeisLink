@@ -20,6 +20,8 @@ dependencies:
   url_launcher: ^6.2.5
   flutter_map: ^7.0.2
   latlong2: ^0.9.1
+  http: ^1.2.1               # Twilio REST calls
+  shared_preferences: ^2.2.3 # Contact storage
 
 
 
