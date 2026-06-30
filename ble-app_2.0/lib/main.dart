@@ -7,31 +7,30 @@ import 'dart:math';
 import 'dart:convert';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
-import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:ble_test_app/config/twilio_config_local.dart';
-
-
+import 'native_sms_service.dart'; // ⚠️ adjust path if you place this file in a subfolder
+ 
+ 
 class EmergencyContact {
   final String id;
   final String name;
   final String phone;
   final String relationship;
-
+ 
   EmergencyContact({
     required this.id,
     required this.name,
     required this.phone,
     this.relationship = '',
   });
-
+ 
   Map<String, dynamic> toJson() => {
         'id': id,
         'name': name,
         'phone': phone,
         'relationship': relationship,
       };
-
+ 
   factory EmergencyContact.fromJson(Map<String, dynamic> json) =>
       EmergencyContact(
         id: json['id'],
@@ -40,13 +39,13 @@ class EmergencyContact {
         relationship: json['relationship'] ?? '',
       );
 }
-
+ 
 // ─────────────────────────────────────────────
 //  CONTACT STORE
 // ─────────────────────────────────────────────
 class ContactStore {
   static const _key = 'emergency_contacts';
-
+ 
   static Future<List<EmergencyContact>> load() async {
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getStringList(_key) ?? [];
@@ -54,7 +53,7 @@ class ContactStore {
         .map((e) => EmergencyContact.fromJson(jsonDecode(e)))
         .toList();
   }
-
+ 
   static Future<void> save(List<EmergencyContact> contacts) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setStringList(
@@ -63,77 +62,24 @@ class ContactStore {
     );
   }
 }
-
-// ─────────────────────────────────────────────
-//  TWILIO SERVICE
-// ─────────────────────────────────────────────
-class TwilioService {
-  /// Returns null on success, error string on failure.
-  static Future<String?> sendSms({
-    required String to,
-    required String body,
-  }) async {
-    final url = Uri.parse(
-      'https://api.twilio.com/2010-04-01/Accounts/${TwilioConfig.accountSid}/Messages.json',
-    );
-
-    final credentials = base64Encode(
-      utf8.encode('${TwilioConfig.accountSid}:${TwilioConfig.authToken}'),
-    );
-
-    try {
-      final response = await http.post(
-        url,
-        headers: {
-          'Authorization': 'Basic $credentials',
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        body: {
-          'MessagingServiceSid': TwilioConfig.messagingServiceSid,
-          'To': to,
-          'Body': body,
-        },
-      ).timeout(const Duration(seconds: 15));
-
-      if (response.statusCode == 201) return null; // success
-      final decoded = jsonDecode(response.body);
-      return decoded['message'] ?? 'HTTP ${response.statusCode}';
-    } catch (e) {
-      return e.toString();
-    }
-  }
-
-  /// Send to all contacts. Returns list of failures (empty = all OK).
-  static Future<List<String>> sendToAll({
-    required List<EmergencyContact> contacts,
-    required String body,
-  }) async {
-    final failures = <String>[];
-    await Future.wait(contacts.map((c) async {
-      final err = await sendSms(to: c.phone, body: body);
-      if (err != null) failures.add('${c.name}: $err');
-    }));
-    return failures;
-  }
-}
-
+ 
 // ─────────────────────────────────────────────
 //  GLOBAL FLAGS
 // ─────────────────────────────────────────────
 bool isReconnecting = false;
-
+ 
 void main() {
   runApp(const MyApp());
 }
-
+ 
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
-
+ 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      title: 'Geo Movement Analysis',
+      title: 'AegisLink',
       theme: ThemeData.dark().copyWith(
         scaffoldBackgroundColor: const Color(0xFF0A0E1A),
         cardColor: const Color(0xFF111827),
@@ -147,66 +93,72 @@ class MyApp extends StatelessWidget {
     );
   }
 }
-
+ 
 // ─────────────────────────────────────────────
 //  MAIN WIDGET
 // ─────────────────────────────────────────────
 class BleHome extends StatefulWidget {
   const BleHome({super.key});
-
+ 
   @override
   State<BleHome> createState() => _BleHomeState();
 }
-
+ 
 class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
   // ── BLE ──────────────────────────────────
   String status = "Waiting...";
   BluetoothDevice? espDevice;
   BluetoothCharacteristic? notifyChar;
   String rawBleData = "--";
-
+ 
   // ── MPU6050 ──────────────────────────────
   double accX = 0, accY = 0, accZ = 0;
   double gyroX = 0, gyroY = 0, gyroZ = 0;
   double mpuTemp = 0;
   double accMagnitude = 0;
-
+ 
+  // ── ESP32 classifier label ───────────────
+  // ⚠️ Set once your ESP32 firmware sends the Random Forest class
+  // as an 8th CSV field, e.g. "NORMAL" / "DISTURBANCE" / "CRASH".
+  // Until then this stays null and the magnitude fallback is used.
+  String? lastEsp32Label;
+ 
   // ── GPS ──────────────────────────────────
   StreamSubscription<Position>? positionStream;
   double currentLat = 0;
   double currentLng = 0;
   double currentSpeed = 0; // m/s
-
+ 
   // ── Geo-fence ────────────────────────────
   final double safeLat = 13.0827;
   final double safeLng = 80.2707;
   final double safeRadius = 500; // metres
   String geoStatus = "✅ Inside Safe Zone";
-
+ 
   // ── Stationary detection ─────────────────
   DateTime? lastMovementTime;
   double previousLat = 0;
   double previousLng = 0;
   String movementStatus = "Moving";
-
+ 
   // ── Trail ────────────────────────────────
   final List<LatLng> trailPoints = [];
-
+ 
   // ── Alert log ────────────────────────────
   final List<String> alertLog = [];
-
+ 
   // ── Contacts ─────────────────────────────
   List<EmergencyContact> _contacts = [];
-
+ 
   // ── Tabs ─────────────────────────────────
   late TabController _tabController;
-
+ 
   // ── Map controller ───────────────────────
   final MapController _mapController = MapController();
-
+ 
   // ── Crash cooldown ───────────────────────
   DateTime? _lastSosTrigger;
-
+ 
   @override
   void initState() {
     super.initState();
@@ -215,14 +167,14 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
     initBle();
     startLocationTracking();
   }
-
+ 
   @override
   void dispose() {
     positionStream?.cancel();
     _tabController.dispose();
     super.dispose();
   }
-
+ 
   // ─────────────────────────────────────────
   //  CONTACTS
   // ─────────────────────────────────────────
@@ -230,11 +182,11 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
     final contacts = await ContactStore.load();
     if (mounted) setState(() => _contacts = contacts);
   }
-
+ 
   Future<void> _saveContacts() async {
     await ContactStore.save(_contacts);
   }
-
+ 
   // ─────────────────────────────────────────
   //  BLE – SCAN
   // ─────────────────────────────────────────
@@ -242,16 +194,17 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
     await Permission.locationWhenInUse.request();
     await Permission.bluetoothScan.request();
     await Permission.bluetoothConnect.request();
-
+    await Permission.sms.request(); // ← required once for native SMS to work
+ 
     if (!(await FlutterBluePlus.isOn)) {
       setState(() => status = "Bluetooth is OFF");
       return;
     }
-
+ 
     setState(() => status = "Scanning...");
-
+ 
     await FlutterBluePlus.startScan(timeout: const Duration(seconds: 10));
-
+ 
     FlutterBluePlus.scanResults.listen((results) async {
       for (var r in results) {
         // ⚠️ Change "ESP32_MPU6050" to your actual ESP32 advertised name
@@ -265,23 +218,23 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
       }
     });
   }
-
+ 
   // ─────────────────────────────────────────
   //  BLE – CONNECT & SUBSCRIBE
   // ─────────────────────────────────────────
   Future<void> connectToEsp32() async {
     if (espDevice == null) return;
-
+ 
     try {
       await espDevice!.connect(autoConnect: false);
     } catch (e) {
       setState(() => status = "Connect error: $e");
       return;
     }
-
+ 
     setState(() => status = "Connected ✅");
     isReconnecting = false;
-
+ 
     espDevice!.connectionState.listen((state) {
       if (state == BluetoothConnectionState.disconnected && !isReconnecting) {
         isReconnecting = true;
@@ -289,68 +242,89 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
         Future.delayed(const Duration(seconds: 3), () => initBle());
       }
     });
-
+ 
     List<BluetoothService> services = await espDevice!.discoverServices();
-
+ 
     for (var service in services) {
       for (var char in service.characteristics) {
         if (char.properties.notify) {
           notifyChar = char;
           await notifyChar!.setNotifyValue(true);
-
+ 
           notifyChar!.onValueReceived.listen((value) async {
             if (!mounted) return;
             final data = String.fromCharCodes(value).trim();
             _parseBleData(data);
           });
-
+ 
           setState(() => status = "Receiving data 📡");
           return;
         }
       }
     }
-
+ 
     setState(() => status = "Characteristic not found ❌");
   }
-
+ 
   // ─────────────────────────────────────────
-  //  PARSE CSV FROM ESP32
-  //  Format: "ax,ay,az,gx,gy,gz,temp"
+  //  PARSE DATA FROM ESP32
+  //
+  //  Supports TWO payload formats:
+  //
+  //  A) Raw only (current firmware):
+  //     "ax,ay,az,gx,gy,gz,temp"
+  //     → falls back to magnitude-threshold check below.
+  //
+  //  B) Raw + classifier label (recommended — once your ESP32
+  //     firmware sends the Random Forest result):
+  //     "ax,ay,az,gx,gy,gz,temp,LABEL"
+  //     where LABEL is e.g. NORMAL / DISTURBANCE / CRASH
+  //     → trusts the edge AI decision directly, no re-thresholding.
   // ─────────────────────────────────────────
   void _parseBleData(String data) {
     final parts = data.split(',');
-    if (parts.length >= 7) {
-      final ax = double.tryParse(parts[0]) ?? accX;
-      final ay = double.tryParse(parts[1]) ?? accY;
-      final az = double.tryParse(parts[2]) ?? accZ;
-      final gx = double.tryParse(parts[3]) ?? gyroX;
-      final gy = double.tryParse(parts[4]) ?? gyroY;
-      final gz = double.tryParse(parts[5]) ?? gyroZ;
-      final temp = double.tryParse(parts[6]) ?? mpuTemp;
-      final mag = sqrt(ax * ax + ay * ay + az * az);
-
-      setState(() {
-        accX = ax; accY = ay; accZ = az;
-        gyroX = gx; gyroY = gy; gyroZ = gz;
-        mpuTemp = temp;
-        accMagnitude = mag;
-        rawBleData = data;
-      });
-
-      if (mag > 25.0 && verifyCrash()) {
-        _triggerSosIfNeeded();
-      }
+    if (parts.length < 7) return;
+ 
+    final ax = double.tryParse(parts[0]) ?? accX;
+    final ay = double.tryParse(parts[1]) ?? accY;
+    final az = double.tryParse(parts[2]) ?? accZ;
+    final gx = double.tryParse(parts[3]) ?? gyroX;
+    final gy = double.tryParse(parts[4]) ?? gyroY;
+    final gz = double.tryParse(parts[5]) ?? gyroZ;
+    final temp = double.tryParse(parts[6]) ?? mpuTemp;
+    final mag = sqrt(ax * ax + ay * ay + az * az);
+ 
+    // Optional 8th field = classifier label from ESP32
+    final label = parts.length >= 8 ? parts[7].trim().toUpperCase() : null;
+ 
+    setState(() {
+      accX = ax; accY = ay; accZ = az;
+      gyroX = gx; gyroY = gy; gyroZ = gz;
+      mpuTemp = temp;
+      accMagnitude = mag;
+      rawBleData = data;
+      lastEsp32Label = label;
+    });
+ 
+    if (_isCrash(label, mag)) {
+      _triggerSosIfNeeded();
     }
   }
-
+ 
   // ─────────────────────────────────────────
-  //  CRASH VERIFY
+  //  CRASH DECISION
+  //  Prefers the ESP32's own classifier output (3-class AI decision).
+  //  Only falls back to a raw magnitude threshold if no label was sent.
   // ─────────────────────────────────────────
-  bool verifyCrash() {
+  bool _isCrash(String? label, double mag) {
+    if (label != null) {
+      return label == "CRASH";
+    }
+    // ⚠️ Fallback only — replace once your firmware sends a label.
     final speedKmh = currentSpeed * 3.6;
-    return speedKmh > 5 && accMagnitude > 20.0;
+    return mag > 25.0 && speedKmh > 5 && mag > 20.0;
   }
-
+ 
   void _triggerSosIfNeeded() {
     final now = DateTime.now();
     if (_lastSosTrigger != null &&
@@ -359,7 +333,7 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
     _addAlert("🚨 CRASH detected! Acc=${accMagnitude.toStringAsFixed(1)} m/s²");
     sendCrashSOS();
   }
-
+ 
   // ─────────────────────────────────────────
   //  GPS TRACKING
   // ─────────────────────────────────────────
@@ -377,16 +351,16 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
         trailPoints.add(LatLng(currentLat, currentLng));
         if (trailPoints.length > 800) trailPoints.removeAt(0);
       });
-
+ 
       try {
         _mapController.move(LatLng(currentLat, currentLng), 16);
       } catch (_) {}
-
+ 
       checkRestrictedArea();
       checkStationary();
     });
   }
-
+ 
   void checkRestrictedArea() {
     final dist = Geolocator.distanceBetween(
         currentLat, currentLng, safeLat, safeLng);
@@ -398,11 +372,11 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
       if (outside) _addAlert("⚠️ Exited safe zone");
     }
   }
-
+ 
   void checkStationary() {
     final dist = Geolocator.distanceBetween(
         previousLat, previousLng, currentLat, currentLng);
-
+ 
     if (dist > 10) {
       previousLat = currentLat;
       previousLng = currentLng;
@@ -410,7 +384,7 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
       setState(() => movementStatus = "Moving 🚗");
       return;
     }
-
+ 
     if (lastMovementTime != null) {
       final halt = DateTime.now().difference(lastMovementTime!);
       if (halt.inMinutes >= 5) {
@@ -419,9 +393,9 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
       }
     }
   }
-
+ 
   // ─────────────────────────────────────────
-  //  SOS — Twilio
+  //  SOS — Native SMS only (no internet needed)
   // ─────────────────────────────────────────
   Future<void> sendCrashSOS() async {
     if (_contacts.isEmpty) {
@@ -429,24 +403,24 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
       setState(() => status = "⚠️ No contacts for SOS");
       return;
     }
-
+ 
     setState(() => status = "🚨 SOS Triggered");
-
+ 
     Position pos = await Geolocator.getCurrentPosition(
         desiredAccuracy: LocationAccuracy.high);
-
+ 
     final url =
         "https://maps.google.com/?q=${pos.latitude},${pos.longitude}";
     final message =
         "🚨 CRASH DETECTED!\nSpeed: ${(currentSpeed * 3.6).toStringAsFixed(1)} km/h\n"
         "Acceleration: ${accMagnitude.toStringAsFixed(2)} m/s²\n"
         "Location: $url";
-
-    final failures = await TwilioService.sendToAll(
+ 
+    final failures = await NativeSmsService.sendToAll(
       contacts: _contacts,
       body: message,
     );
-
+ 
     if (failures.isEmpty) {
       _addAlert("✅ SOS sent to ${_contacts.length} contact(s)");
       setState(() => status = "Receiving data 📡");
@@ -455,7 +429,7 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
       setState(() => status = "SOS partial failure");
     }
   }
-
+ 
   // ─────────────────────────────────────────
   //  ALERT LOG
   // ─────────────────────────────────────────
@@ -466,17 +440,17 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
     setState(() => alertLog.insert(0, "[$time] $msg"));
     if (alertLog.length > 50) alertLog.removeLast();
   }
-
+ 
   // ─────────────────────────────────────────
   //  HELPERS
   // ─────────────────────────────────────────
   double get speedKmh => currentSpeed * 3.6;
   Color get speedColor =>
       speedKmh > 80 ? Colors.red : (speedKmh > 50 ? Colors.orange : Colors.greenAccent);
-
+ 
   Color get accColor =>
       accMagnitude > 25 ? Colors.red : (accMagnitude > 15 ? Colors.orange : Colors.greenAccent);
-
+ 
   // ─────────────────────────────────────────
   //  BUILD
   // ─────────────────────────────────────────
@@ -485,7 +459,7 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
     return Scaffold(
       appBar: AppBar(
         title: const Text(
-          "AgeisLink",
+          "AegisLink",
           style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16),
         ),
         actions: [
@@ -525,7 +499,7 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
           ],
         ),
       ),
-
+ 
       body: TabBarView(
         controller: _tabController,
         children: [
@@ -543,7 +517,7 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
       ),
     );
   }
-
+ 
   // ─────────────────────────────────────────
   //  TAB 1 — DASHBOARD
   // ─────────────────────────────────────────
@@ -588,12 +562,12 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
             value: movementStatus,
             color: movementStatus.contains("⚠") ? Colors.orange : Colors.cyanAccent,
           ),
-
+ 
           const SizedBox(height: 20),
-
+ 
           _sectionLabel("🔵 ESP32 MPU6050"),
           const SizedBox(height: 8),
-
+ 
           if (status != "Receiving data 📡" && !status.contains("✅"))
             _bleOffCard()
           else ...[
@@ -613,9 +587,9 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
             const SizedBox(height: 10),
             _crashStatusCard(),
           ],
-
+ 
           const SizedBox(height: 20),
-
+ 
           // Contact count warning
           if (_contacts.isEmpty)
             Container(
@@ -643,7 +617,7 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
                 ),
               ]),
             ),
-
+ 
           SizedBox(
             width: double.infinity,
             child: ElevatedButton.icon(
@@ -668,7 +642,7 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
       ),
     );
   }
-
+ 
   // ─────────────────────────────────────────
   //  TAB 2 — MAP
   // ─────────────────────────────────────────
@@ -676,7 +650,7 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
     final center = currentLat == 0
         ? const LatLng(13.0827, 80.2707)
         : LatLng(currentLat, currentLng);
-
+ 
     return Stack(
       children: [
         FlutterMap(
@@ -688,9 +662,9 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
           children: [
             TileLayer(
               urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-              userAgentPackageName: 'com.example.blegeo',
+              userAgentPackageName: 'com.example.ble_test_app',
             ),
-
+ 
             if (trailPoints.length > 1)
               PolylineLayer(
                 polylines: [
@@ -701,7 +675,7 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
                   ),
                 ],
               ),
-
+ 
             if (currentLat != 0)
               MarkerLayer(
                 markers: [
@@ -736,7 +710,7 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
               ),
           ],
         ),
-
+ 
         Positioned(
           bottom: 20,
           left: 16,
@@ -760,7 +734,7 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
             ]),
           ),
         ),
-
+ 
         Positioned(
           top: 12,
           left: 12,
@@ -781,7 +755,7 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
       ],
     );
   }
-
+ 
   // ─────────────────────────────────────────
   //  TAB 3 — ALERTS
   // ─────────────────────────────────────────
@@ -798,7 +772,7 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
         ),
       );
     }
-
+ 
     return ListView.builder(
       padding: const EdgeInsets.all(14),
       itemCount: alertLog.length,
@@ -834,7 +808,7 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
       },
     );
   }
-
+ 
   // ─────────────────────────────────────────
   //  CARD WIDGETS
   // ─────────────────────────────────────────
@@ -847,7 +821,7 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
                 fontWeight: FontWeight.w600,
                 letterSpacing: 0.8)),
       );
-
+ 
   Widget _statCard(
       String label, String value, String unit, Color color, IconData icon) {
     return Expanded(
@@ -886,7 +860,7 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
       ),
     );
   }
-
+ 
   Widget _wideCard(
       {required IconData icon,
       required String label,
@@ -915,7 +889,7 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
       ]),
     );
   }
-
+ 
   Widget _axisCard(String title, double x, double y, double z,
       Color cx, Color cy, Color cz) {
     return Container(
@@ -939,7 +913,7 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
       ]),
     );
   }
-
+ 
   Widget _axisValue(String axis, double val, Color color) {
     return Expanded(
       child: Column(children: [
@@ -953,9 +927,12 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
       ]),
     );
   }
-
+ 
   Widget _crashStatusCard() {
-    final crashed = accMagnitude > 25.0;
+    final crashed = lastEsp32Label != null
+        ? lastEsp32Label == "CRASH"
+        : accMagnitude > 25.0;
+    final labelText = lastEsp32Label ?? "(no AI label received yet)";
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(14),
@@ -977,18 +954,29 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
           size: 22,
         ),
         const SizedBox(width: 12),
-        Text(
-          crashed ? "⚠️ HIGH IMPACT DETECTED" : "Normal — No crash detected",
-          style: TextStyle(
-            color: crashed ? Colors.red : Colors.greenAccent,
-            fontSize: 13,
-            fontWeight: FontWeight.w700,
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                crashed ? "⚠️ HIGH IMPACT DETECTED" : "Normal — No crash detected",
+                style: TextStyle(
+                  color: crashed ? Colors.red : Colors.greenAccent,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              Text(
+                "AI label: $labelText",
+                style: const TextStyle(fontSize: 11, color: Colors.grey),
+              ),
+            ],
           ),
         ),
       ]),
     );
   }
-
+ 
   Widget _bleOffCard() {
     return Container(
       width: double.infinity,
@@ -1025,7 +1013,7 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
       ]),
     );
   }
-
+ 
   String _totalTrailKm() {
     if (trailPoints.length < 2) return "0.00";
     double total = 0;
@@ -1038,20 +1026,20 @@ class _BleHomeState extends State<BleHome> with SingleTickerProviderStateMixin {
     return (total / 1000).toStringAsFixed(2);
   }
 }
-
+ 
 // ─────────────────────────────────────────────
 //  CONTACTS SCREEN  (Tab 4)
 // ─────────────────────────────────────────────
 class ContactsScreen extends StatelessWidget {
   final List<EmergencyContact> contacts;
   final void Function(List<EmergencyContact>) onChanged;
-
+ 
   const ContactsScreen({
     super.key,
     required this.contacts,
     required this.onChanged,
   });
-
+ 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -1160,7 +1148,7 @@ class ContactsScreen extends StatelessWidget {
           : null,
     );
   }
-
+ 
   void _openContactForm(BuildContext context, EmergencyContact? existing) {
     showModalBottomSheet(
       context: context,
@@ -1184,7 +1172,7 @@ class ContactsScreen extends StatelessWidget {
       ),
     );
   }
-
+ 
   void _confirmDelete(BuildContext context, EmergencyContact c) {
     showDialog(
       context: context,
@@ -1215,25 +1203,25 @@ class ContactsScreen extends StatelessWidget {
     );
   }
 }
-
+ 
 // ─────────────────────────────────────────────
 //  CONTACT FORM (bottom sheet)
 // ─────────────────────────────────────────────
 class _ContactForm extends StatefulWidget {
   final EmergencyContact? existing;
   final void Function(EmergencyContact) onSave;
-
+ 
   const _ContactForm({required this.existing, required this.onSave});
-
+ 
   @override
   State<_ContactForm> createState() => _ContactFormState();
 }
-
+ 
 class _ContactFormState extends State<_ContactForm> {
   late final TextEditingController _name;
   late final TextEditingController _phone;
   late final TextEditingController _relationship;
-
+ 
   @override
   void initState() {
     super.initState();
@@ -1242,7 +1230,7 @@ class _ContactFormState extends State<_ContactForm> {
     _relationship =
         TextEditingController(text: widget.existing?.relationship ?? '');
   }
-
+ 
   @override
   void dispose() {
     _name.dispose();
@@ -1250,7 +1238,7 @@ class _ContactFormState extends State<_ContactForm> {
     _relationship.dispose();
     super.dispose();
   }
-
+ 
   void _submit() {
     final name = _name.text.trim();
     final phone = _phone.text.trim();
@@ -1270,7 +1258,7 @@ class _ContactFormState extends State<_ContactForm> {
     widget.onSave(contact);
     Navigator.pop(context);
   }
-
+ 
   @override
   Widget build(BuildContext context) {
     final bottom = MediaQuery.of(context).viewInsets.bottom;
@@ -1316,7 +1304,7 @@ class _ContactFormState extends State<_ContactForm> {
       ),
     );
   }
-
+ 
   Widget _field(TextEditingController ctrl, String hint, IconData icon,
       {TextInputType type = TextInputType.text}) {
     return TextField(
@@ -1347,3 +1335,4 @@ class _ContactFormState extends State<_ContactForm> {
     );
   }
 }
+ 
