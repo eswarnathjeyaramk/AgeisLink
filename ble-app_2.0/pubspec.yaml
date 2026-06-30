@@ -1,13 +1,13 @@
 name: ble_test_app
 description: BLE Crash Alert App
-
+ 
 publish_to: 'none'
-
+ 
 version: 1.0.0+1
-
+ 
 environment:
   sdk: ">=3.2.0 <4.0.0"
-
+ 
 dependencies:
   flutter:
     sdk: flutter
@@ -17,13 +17,11 @@ dependencies:
   flutter_blue_plus: ^1.16.0
   geolocator: ^10.1.0
   permission_handler: ^11.0.1
-  url_launcher: ^6.2.5
   flutter_map: ^7.0.2
   latlong2: ^0.9.1
-  http: ^1.2.1               # Twilio REST calls
   shared_preferences: ^2.2.3 # Contact storage
-
-
-
+ 
+ 
 flutter:
   uses-material-design: true
+ 
